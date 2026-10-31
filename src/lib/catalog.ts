@@ -7,6 +7,7 @@ export type Item = {
   name: string;
   price: number;
   note?: string;
+  dbId?: string;
 };
 
 export type Service = {
@@ -22,6 +23,7 @@ export type Service = {
   bill?: boolean;
   admin?: number;
   items?: (provider: string) => Item[];
+  dbServiceId?: string;
 };
 
 export const OPS: Record<string, { name: string; pre: string[]; m: number }> = {
@@ -297,35 +299,4 @@ export const minPrice = (slug: string) => {
   const provider = service.detect ? "telkomsel" : Object.keys(service.providers || {})[0] || "";
   const list = service.items(provider);
   return list.length ? Math.min(...list.map((item) => item.price)) : null;
-};
-
-export type Bill = {
-  nama: string;
-  periode: string;
-  amt: number;
-};
-
-export const simulateBill = (slug: string, seed: string): Bill => {
-  let hash = 0;
-  for (const char of seed) hash = (hash * 31 + char.charCodeAt(0)) % 100000;
-  const base = {
-    pdam: [60000, 260000],
-    "tv-internet": [250000, 520000],
-    multifinance: [650000, 1900000],
-  }[slug] || [60000, 260000];
-  const amt = round100(base[0] + ((hash % 1000) / 1000) * (base[1] - base[0]));
-  const names = [
-    "Budi Santoso",
-    "Siti Rahma",
-    "Andi Pratama",
-    "Dewi Lestari",
-    "Rizky Maulana",
-    "Nur Aisyah",
-  ];
-  const months = ["Agustus", "September", "Oktober"];
-  return {
-    nama: names[hash % names.length],
-    periode: months[hash % 3] + " 2026",
-    amt,
-  };
 };

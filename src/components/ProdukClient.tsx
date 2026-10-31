@@ -1,34 +1,39 @@
 "use client";
 
 import Link from "next/link";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { Breadcrumbs } from "@/components/Breadcrumbs";
 import { Icon } from "@/components/Icon";
 import {
   detectOperator,
   formatRp,
-  isSlug,
   normalizePhone,
   OPS,
   SERVICES,
   SERVICE_ORDER,
-  simulateBill,
+  type Item,
 } from "@/lib/catalog";
-import { newOrderId, saveOrder, type Order } from "@/lib/store";
+import type { HydratedService } from "@/lib/catalog-hydrate";
+import { createOrder } from "@/lib/db/client";
+import { toPublicError } from "@/lib/db/errors";
+import { rememberInvoice } from "@/lib/store";
 
-export function ProdukClient() {
-  const search = useSearchParams();
-  const raw = search.get("s");
-  const slug = raw && isSlug(raw) ? raw : "pulsa";
-
-  return <ProdukForm key={slug} slug={slug} />;
-}
-
-function ProdukForm({ slug }: { slug: string }) {
+export function ProdukClient({
+  service,
+  slug,
+  brandSlug,
+  qrisMethodId,
+}: {
+  service: HydratedService;
+  slug: string;
+  brandSlug: string;
+  qrisMethodId: string | null;
+}) {
   const router = useRouter();
-  const service = SERVICES[slug];
-  const providerKeys = service.providers ? Object.keys(service.providers) : [];
+  const providerKeys = service.detect
+    ? Object.keys(OPS)
+    : Object.keys(service.providers ?? {});
   const hasProviders = providerKeys.length > 0;
 
   const [target, setTarget] = useState("");
@@ -36,6 +41,8 @@ function ProdukForm({ slug }: { slug: string }) {
     providerKeys.length === 1 ? providerKeys[0] : null,
   );
   const [itemId, setItemId] = useState<string | null>(null);
+  const [paying, setPaying] = useState(false);
+  const [payError, setPayError] = useState("");
 
   const operator = service.detect ? detectOperator(target) : null;
   const activeProvider = service.detect ? operator : provider;
@@ -54,24 +61,13 @@ function ProdukForm({ slug }: { slug: string }) {
     : digits.length >= 6;
   const providerOk = service.detect ? !!operator : hasProviders ? !!provider : true;
 
-  const bill =
-    service.bill && targetOk && provider
-      ? simulateBill(slug, target.trim() + provider)
-      : null;
+  const bill: Item | null =
+    service.bill && targetOk && provider ? service.billItem : null;
 
-  const items = (() => {
-    if (service.bill) {
-      if (!bill) return [];
-      return [
-        {
-          id: "bill",
-          name: `Tagihan ${bill.periode}`,
-          price: bill.amt + (service.admin || 0),
-        },
-      ];
-    }
-    if (!service.items || !activeProvider) return [];
-    return service.items(activeProvider);
+  const items: Item[] = (() => {
+    if (service.bill) return bill ? [bill] : [];
+    if (!activeProvider) return [];
+    return service.itemGroups[activeProvider] ?? [];
   })();
 
   const item = service.bill ? items[0] : items.find((entry) => entry.id === itemId);
@@ -91,23 +87,47 @@ function ProdukForm({ slug }: { slug: string }) {
     setItemId(null);
   };
 
-  const go = () => {
-    if (!ready || !item) return;
-    const id = newOrderId();
-    const order: Order = {
-      id,
-      slug,
-      service: service.name,
-      provider: providerName || "-",
-      item: item.name,
-      target: phoneLike ? normalizePhone(target) : target.trim(),
-      amount: item.price,
-      method: "QRIS",
-      status: "processing",
-      createdAt: Date.now(),
-    };
-    saveOrder(order);
-    router.push(`/bayar?id=${id}`);
+  const go = async () => {
+    if (!ready || !item || paying) return;
+    if (!service.dbServiceId || !item.dbId) {
+      setPayError("Data produk belum lengkap. Muat ulang halaman.");
+      return;
+    }
+    if (!brandSlug || !qrisMethodId) {
+      setPayError("Pembayaran belum tersedia. Coba lagi sebentar.");
+      return;
+    }
+
+    const targetValue = phoneLike ? normalizePhone(target) : target.trim();
+    setPaying(true);
+    setPayError("");
+    try {
+      const created = await createOrder({
+        brandSlug,
+        serviceId: service.dbServiceId,
+        productId: item.dbId,
+        nomorTujuan: targetValue,
+        input: {
+          provider: providerName || "-",
+          item: item.name,
+          nomor_tujuan: targetValue,
+        },
+        paymentMethodId: qrisMethodId,
+      });
+      rememberInvoice({
+        ref: created.ref,
+        service: service.name,
+        item: item.name,
+        target: targetValue,
+        slug,
+        amount: created.total,
+        createdAt: Date.now(),
+      });
+      router.push(`/bayar?id=${created.ref}`);
+    } catch (error) {
+      setPayError(toPublicError(error).message);
+      setPaying(false);
+    }
   };
 
   const helper = service.detect
@@ -115,7 +135,7 @@ function ProdukForm({ slug }: { slug: string }) {
       ? `Operator terdeteksi: ${OPS[operator].name}.`
       : "Operator terdeteksi otomatis dari 4 digit awal."
     : service.bill
-      ? "Tagihan muncul otomatis setelah ID diisi."
+      ? "Nominal tagihan dari katalog, dicek admin."
       : hasProviders && service.phone
         ? "Pilih e-wallet dulu, lalu masukkan nomor yang terdaftar."
         : service.cat === "hiburan"
@@ -123,15 +143,17 @@ function ProdukForm({ slug }: { slug: string }) {
           : "Pastikan data tujuan sudah benar.";
 
   const itemsStep = hasProviders ? 3 : 2;
-  const hint = !targetOk
-    ? `Isi ${service.input.toLowerCase()} dulu`
-    : !providerOk
-      ? hasProviders && service.phone
-        ? "Pilih e-wallet dulu"
-        : "Pilih provider dulu"
-      : !item
-        ? "Pilih nominal dulu"
-        : item.name;
+  const hint = payError
+    ? `⚠ ${payError}`
+    : !targetOk
+      ? `Isi ${service.input.toLowerCase()} dulu`
+      : !providerOk
+        ? hasProviders && service.phone
+          ? "Pilih e-wallet dulu"
+          : "Pilih provider dulu"
+        : !item
+          ? "Pilih nominal dulu"
+          : item.name;
 
   return (
     <>
@@ -276,20 +298,16 @@ function ProdukForm({ slug }: { slug: string }) {
                   <>
                     <div className="bill">
                       <div>
-                        <span className="muted">Nama</span>
-                        <b>{bill.nama}</b>
+                        <span className="muted">Produk</span>
+                        <b>{bill.name}</b>
                       </div>
                       <div>
-                        <span className="muted">Periode</span>
-                        <b>{bill.periode}</b>
+                        <span className="muted">Provider</span>
+                        <b>{providerName || "-"}</b>
                       </div>
                       <div>
-                        <span className="muted">Tagihan</span>
-                        <b>{formatRp(bill.amt)}</b>
-                      </div>
-                      <div>
-                        <span className="muted">Admin</span>
-                        <b>{formatRp(service.admin || 0)}</b>
+                        <span className="muted">Tujuan</span>
+                        <b>{target.trim()}</b>
                       </div>
                       <div
                         style={{
@@ -302,7 +320,7 @@ function ProdukForm({ slug }: { slug: string }) {
                       </div>
                     </div>
                     <p className="muted" style={{ fontSize: 12, marginTop: 8 }}>
-                      Data tagihan masih simulasi.
+                      Nominal dari katalog. Dicek admin sebelum diproses.
                     </p>
                   </>
                 ) : (
@@ -382,11 +400,19 @@ function ProdukForm({ slug }: { slug: string }) {
               type="button"
               className="btn btn-red"
               style={{ width: "100%" }}
-              disabled={!ready}
-              onClick={go}
+              disabled={!ready || paying}
+              onClick={() => void go()}
             >
-              Lanjut bayar
+              {paying ? "Memproses…" : "Lanjut bayar"}
             </button>
+            {payError ? (
+              <p
+                className="muted"
+                style={{ fontSize: 12, marginTop: 8, color: "var(--orange)" }}
+              >
+                {payError}
+              </p>
+            ) : null}
           </aside>
         </div>
       </main>
@@ -396,8 +422,13 @@ function ProdukForm({ slug }: { slug: string }) {
           <div className="st">{hint}</div>
           <div className="tt">{item ? formatRp(item.price) : "Rp0"}</div>
         </div>
-        <button type="button" className="btn btn-red" disabled={!ready} onClick={go}>
-          Bayar
+        <button
+          type="button"
+          className="btn btn-red"
+          disabled={!ready || paying}
+          onClick={() => void go()}
+        >
+          {paying ? "…" : "Bayar"}
         </button>
       </div>
     </>

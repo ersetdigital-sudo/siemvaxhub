@@ -10,27 +10,71 @@ import {
   ADMIN_WA,
   PAID_MESSAGE,
   QRIS_IMAGE,
-  findOrder,
   formatDate,
   waLink,
-  type Order,
 } from "@/lib/store";
+
+type PublicStatus = "success" | "processing" | "pending" | "expired";
+
+type ApiOrder = {
+  inv: string;
+  status: PublicStatus;
+  service: string;
+  product: string;
+  lines: [string, string][];
+  method: string;
+  total: number;
+  sn: string;
+  label: string;
+  created: number;
+  updated: number;
+  paidAt?: number;
+  qris: string | null;
+};
+
+const statusText: Record<PublicStatus, string> = {
+  pending: "Menunggu pembayaran",
+  processing: "Sedang diproses",
+  success: "Selesai",
+  expired: "Dibatalkan",
+};
+
+function slugOf(name: string) {
+  const entry = Object.entries(SERVICES).find(([, service]) => service.name === name);
+  return entry ? entry[0] : "pulsa";
+}
 
 export function BayarClient() {
   const search = useSearchParams();
   const id = (search.get("id") ?? "").trim().toUpperCase();
-  const [order, setOrder] = useState<Order | null | undefined>(undefined);
+  const [order, setOrder] = useState<ApiOrder | null | undefined>(undefined);
   const [paid, setPaid] = useState(false);
   const [copied, setCopied] = useState(false);
 
   useEffect(() => {
-    setOrder(id ? findOrder(id) ?? null : null);
+    let alive = true;
+    if (!id) {
+      setOrder(null);
+      return;
+    }
+    setOrder(undefined);
+    fetch(`/api/orders/${encodeURIComponent(id)}`, { cache: "no-store" })
+      .then((response) => (response.ok ? response.json() : null))
+      .then((data) => {
+        if (alive) setOrder((data as ApiOrder | null) ?? null);
+      })
+      .catch(() => {
+        if (alive) setOrder(null);
+      });
+    return () => {
+      alive = false;
+    };
   }, [id]);
 
   const copyId = async () => {
     if (!order) return;
     try {
-      await navigator.clipboard.writeText(order.id);
+      await navigator.clipboard.writeText(order.inv);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1600);
     } catch {
@@ -70,8 +114,8 @@ export function BayarClient() {
           </span>
           <h1 style={{ fontSize: 34, margin: "18px 0 8px" }}>Pesanan nggak ketemu</h1>
           <p className="muted" style={{ marginBottom: 22 }}>
-            Kode pesanan tidak ada di perangkat ini. Pilih produk dulu atau cek
-            invoice yang sudah ada.
+            Kode pesanan tidak cocok dengan data server. Pilih produk dulu atau
+            cek invoice yang sudah ada.
           </p>
           <div style={{ display: "flex", justifyContent: "center", gap: 10, flexWrap: "wrap" }}>
             <Link href="/produk?s=pulsa" className="btn btn-red">
@@ -86,9 +130,12 @@ export function BayarClient() {
     );
   }
 
-  const service = SERVICES[order.slug];
+  const target =
+    order.lines.find(([label]) => /tujuan/i.test(label))?.[1] ?? "-";
+  const activeStatus = paid ? "processing" : order.status;
+  const canPay = activeStatus === "pending";
   const waMessage = waLink(
-    `Halo, saya sudah bayar pesanan ${order.id} sebesar ${formatRp(order.amount)}. Mohon dicek ya.`,
+    `Halo, saya sudah bayar pesanan ${order.inv} sebesar ${formatRp(order.total)}. Mohon dicek ya.`,
   );
 
   return (
@@ -103,7 +150,7 @@ export function BayarClient() {
         />
 
         <Link
-          href={`/produk?s=${order.slug}`}
+          href={`/produk?s=${slugOf(order.service)}`}
           className="muted"
           style={{
             display: "inline-flex",
@@ -127,16 +174,36 @@ export function BayarClient() {
           }}
         >
           <h1 style={{ fontSize: "clamp(36px,8vw,56px)", fontWeight: 900 }}>
-            {paid ? "Pembayaran diterima" : "Pembayaran"}
+            {paid
+              ? "Pembayaran diterima"
+              : activeStatus === "success"
+                ? "Pesanan selesai"
+                : activeStatus === "expired"
+                  ? "Pesanan dibatalkan"
+                  : "Pembayaran"}
           </h1>
           <span
             className="badge"
             style={{
-              background: paid ? "var(--soft)" : "var(--orange)",
-              color: paid ? "var(--red)" : "var(--ink)",
+              background:
+                activeStatus === "success" || paid
+                  ? "var(--soft)"
+                  : activeStatus === "expired"
+                    ? "var(--soft)"
+                    : "var(--orange)",
+              color:
+                activeStatus === "success" || paid || activeStatus === "expired"
+                  ? "var(--red)"
+                  : "var(--ink)",
             }}
           >
-            {paid ? "⏳ Sedang diproses" : "⏳ Menunggu pembayaran"}
+            {activeStatus === "success" || paid
+              ? "✓ Selesai"
+              : activeStatus === "processing"
+                ? "⏳ Sedang diproses"
+                : activeStatus === "expired"
+                  ? "✕ Dibatalkan"
+                  : "⏳ Menunggu pembayaran"}
           </span>
         </div>
 
@@ -149,7 +216,7 @@ export function BayarClient() {
             }}
           >
             <div className="card step">
-              {paid ? (
+              {!canPay ? (
                 <div style={{ padding: "24px 8px", textAlign: "center" }}>
                   <span
                     style={{
@@ -162,18 +229,26 @@ export function BayarClient() {
                       placeItems: "center",
                     }}
                   >
-                    <Icon name="check" className="h-8 w-8" />
+                    <Icon name={activeStatus === "expired" ? "clock" : "check"} className="h-8 w-8" />
                   </span>
                   <h2
                     className="fh"
                     style={{ fontSize: "clamp(26px,6vw,40px)", margin: "20px auto 10px", maxWidth: 460 }}
                   >
-                    {PAID_MESSAGE}
+                    {paid
+                      ? PAID_MESSAGE
+                      : activeStatus === "success"
+                        ? "Terima kasih, pesanan sudah selesai"
+                        : "Pesanan sudah dibatalkan"}
                   </h2>
                   <p className="muted" style={{ maxWidth: 440, margin: "0 auto" }}>
-                    Pembayaran QRIS kamu dicek tim kami, lalu pesanan diteruskan
-                    ke provider. Pantau statusnya dengan kode{" "}
-                    <b style={{ color: "var(--ink)" }}>{order.id}</b>.
+                    {paid
+                      ? "Pembayaran QRIS kamu dicek tim kami, lalu pesanan diteruskan ke provider."
+                      : activeStatus === "success"
+                        ? "Produk sudah dikirim. Cek detail dan SN di halaman invoice."
+                        : "Pesanan ini sudah tidak aktif. Silakan buat pesanan baru bila perlu."}{" "}
+                    Pantau statusnya dengan kode{" "}
+                    <b style={{ color: "var(--ink)" }}>{order.inv}</b>.
                   </p>
                   <div
                     style={{
@@ -184,7 +259,7 @@ export function BayarClient() {
                       marginTop: 24,
                     }}
                   >
-                    <Link href={`/invoice?id=${order.id}`} className="btn btn-red">
+                    <Link href={`/invoice?id=${order.inv}`} className="btn btn-red">
                       Cek invoice <Icon name="arrow" className="h-4 w-4" />
                     </Link>
                     <a
@@ -217,10 +292,10 @@ export function BayarClient() {
                         Total bayar
                       </div>
                       <div className="fh" style={{ fontSize: "clamp(38px,9vw,56px)", fontWeight: 900 }}>
-                        {formatRp(order.amount)}
+                        {formatRp(order.total)}
                       </div>
                       <div className="muted" style={{ fontSize: 13, fontWeight: 600 }}>
-                        {order.id} · {formatDate(order.createdAt)}
+                        {order.inv} · {formatDate(order.created)}
                       </div>
                     </div>
                     <span className="badge" style={{ background: "var(--soft)" }}>
@@ -249,7 +324,7 @@ export function BayarClient() {
                       }}
                     >
                       <img
-                        src={QRIS_IMAGE}
+                        src={order.qris || QRIS_IMAGE}
                         alt="Kode QRIS untuk pembayaran pesanan"
                         width={520}
                         height={520}
@@ -270,7 +345,7 @@ export function BayarClient() {
                       {[
                         "Buka aplikasi bank atau e-wallet pilihanmu.",
                         "Pilih menu bayar QRIS, lalu scan kode di samping.",
-                        `Periksa nominal ${formatRp(order.amount)} dan selesaikan pembayaran.`,
+                        `Periksa nominal ${formatRp(order.total)} dan selesaikan pembayaran.`,
                         'Tekan "Saya sudah bayar" setelah transaksi berhasil.',
                       ].map((text, index) => (
                         <li key={text} style={{ display: "flex", gap: 10 }}>
@@ -317,7 +392,7 @@ export function BayarClient() {
                     className="muted"
                     style={{ fontSize: 12, textAlign: "center", marginTop: 10 }}
                   >
-                    Pembayaran dicek manual · simpan kode {order.id}
+                    Pembayaran dicek manual · simpan kode {order.inv}
                   </p>
                 </>
               )}
@@ -340,10 +415,10 @@ export function BayarClient() {
             <dl style={{ marginTop: 10 }}>
               {[
                 ["Produk", order.service],
-                ["Provider", order.provider],
-                ["Item", order.item],
-                ["Tujuan", order.target],
+                ["Item", order.product],
+                ["Tujuan", target],
                 ["Metode", order.method],
+                ["Status", statusText[activeStatus]],
               ].map(([label, value]) => (
                 <div key={label}>
                   <dt>{label}</dt>
@@ -361,7 +436,7 @@ export function BayarClient() {
             >
               <span className="muted">Total bayar</span>
               <b className="fh red" style={{ fontSize: 30 }}>
-                {formatRp(order.amount)}
+                {formatRp(order.total)}
               </b>
             </div>
             <div
@@ -378,7 +453,7 @@ export function BayarClient() {
             </div>
             <p className="muted" style={{ fontSize: 12, marginTop: 12 }}>
               Butuh bantuan? WhatsApp {ADMIN_WA}.{" "}
-              {service.name} diproses setelah pembayaran dicek.
+              {order.service} diproses setelah pembayaran dicek.
             </p>
           </aside>
         </div>
@@ -387,18 +462,18 @@ export function BayarClient() {
       <div className="fbar">
         <div style={{ minWidth: 0, flex: 1 }}>
           <div className="st">
-            {paid ? `${order.id} · sedang diproses` : `${order.id} · QRIS`}
+            {order.inv} · {statusText[activeStatus].toLowerCase()}
           </div>
-          <div className="tt">{formatRp(order.amount)}</div>
+          <div className="tt">{formatRp(order.total)}</div>
         </div>
-        {paid ? (
-          <Link href={`/invoice?id=${order.id}`} className="btn btn-red">
-            Cek
-          </Link>
-        ) : (
+        {canPay ? (
           <button type="button" className="btn btn-red" onClick={() => setPaid(true)}>
             Saya sudah bayar
           </button>
+        ) : (
+          <Link href={`/invoice?id=${order.inv}`} className="btn btn-red">
+            Cek
+          </Link>
         )}
       </div>
     </>
